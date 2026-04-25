@@ -10,7 +10,7 @@ The Neural Network architecture uses "Early Fusion" by stacking the RGB channels
 ## Setup
 
 ```bash
-pip install torch torchvision pillow requests tqdm matplotlib
+pip install torch torchvision pillow requests tqdm matplotlib opencv-python
 ```
 
 ## How to Train
@@ -34,3 +34,13 @@ python3 src/inference.py --checkpoint checkpoints/tsr_model_epoch_1000.pth --out
 ```
 
 The resulting comparison image will show four panels: the offset previous frame, the current frame, bicubic scaling, and the TSR output.
+
+## How to Test on Video
+
+To see the Temporal Super Resolution model in action frame-by-frame, you can run the video inference script. It will automatically generate a low-resolution panning video (from one of the sample images) and upscale it.
+
+```bash
+python3 src/video_inference.py --checkpoint checkpoints/tsr_model_epoch_1000.pth
+```
+
+This will output a video file in `assets/tsr_upscaled_video.mp4` showing a side-by-side comparison of the Bicubic scaling vs the AI TSR output as the camera moves!
