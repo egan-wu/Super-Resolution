@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from warp import backward_warp
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -77,13 +78,130 @@ class TemporalSRResNet(nn.Module):
         # We can use sigmoid or just clamp later in inference. No strict activation here is typical.
         return out
 
-if __name__ == "__main__":
-    # Test model with dummy temporal input
-    model = TemporalSRResNet(scale_factor=4)
-    # Dummy tensors (Batch Size 1, Channels 3, Height 32, Width 32)
-    dummy_prev = torch.randn(1, 3, 32, 32)
-    dummy_curr = torch.randn(1, 3, 32, 32)
+class WarpTSRNet(nn.Module):
+    """
+    Phase 2: Warp-then-Fuse Temporal Super-Resolution.
 
-    output = model(dummy_prev, dummy_curr)
-    print(f"Input Shape: Prev {dummy_prev.shape}, Curr {dummy_curr.shape}")
-    print(f"Output Shape: {output.shape}")
+    Instead of naively stacking t-1 and t (early fusion), we:
+      1. Backward-warp LR(t-1) onto LR(t) using the known motion flow.
+      2. Concatenate [warped_prev (3ch), lr_curr (3ch), occlusion_mask (1ch)] = 7ch.
+      3. Run the same ResNet + PixelShuffle upsampler.
+
+    This gives the network a geometrically-aligned history signal rather than
+    a misaligned one, which is the core DLSS trick.
+    """
+
+    def __init__(self, in_channels=7, num_res_blocks=16, scale_factor=4):
+        super().__init__()
+
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=9, padding=4)
+        self.prelu1 = nn.PReLU()
+
+        self.res_blocks = nn.Sequential(
+            *[ResidualBlock(64) for _ in range(num_res_blocks)]
+        )
+
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
+
+        upsample_blocks = []
+        for _ in range(2):  # 2x * 2x = 4x
+            upsample_blocks.append(nn.Conv2d(64, 256, kernel_size=3, padding=1))
+            upsample_blocks.append(nn.PixelShuffle(2))
+            upsample_blocks.append(nn.PReLU())
+        self.upsample = nn.Sequential(*upsample_blocks)
+
+        self.conv3 = nn.Conv2d(64, 3, kernel_size=9, padding=4)
+
+    def forward(self, x_prev, x_curr, flow):
+        """
+        x_prev : (B, 3, H, W) — LR frame t-1
+        x_curr : (B, 3, H, W) — LR frame t
+        flow   : (B, 2)        — backward warp flow in LR pixels
+        """
+        warped_prev, mask = backward_warp(x_prev, flow)
+
+        x = torch.cat([warped_prev, x_curr, mask], dim=1)  # (B, 7, H, W)
+
+        out1 = self.prelu1(self.conv1(x))
+        res = self.res_blocks(out1)
+        out2 = self.bn2(self.conv2(res))
+        out = out1 + out2
+        out = self.upsample(out)
+        return self.conv3(out)
+
+
+class RecurrentTSRNet(nn.Module):
+    """
+    Phase 3: Recurrent Temporal Super-Resolution (DLSS-style feedback loop).
+
+    Architecture:
+      LR branch  — feature extraction at LR resolution + PixelShuffle ×4 → 64ch @ HR
+      Hist branch — warp HR(t-1) at HR space, extract features               → 64ch @ HR
+      Fusion      — concat (128ch) → refine → HR output
+
+    At inference, HR(t-1) is the model's own previous output (true recurrence).
+    During training, HR(t-1) is the GT frame (teacher forcing).
+
+    The Halton jitter in SRSequenceDataset gives each frame a different sub-pixel
+    view of the scene. The recurrent feedback accumulates these shifted samples into
+    increasingly sharp HR outputs — the same principle as DLSS.
+    """
+
+    def __init__(self, scale_factor=4, lr_res_blocks=8, hist_res_blocks=4, fuse_res_blocks=4):
+        super().__init__()
+        self.scale_factor = scale_factor
+
+        # --- LR branch (operates at LR resolution) ---
+        self.lr_entry = nn.Sequential(nn.Conv2d(3, 64, 9, padding=4), nn.PReLU())
+        self.lr_res   = nn.Sequential(*[ResidualBlock(64) for _ in range(lr_res_blocks)])
+        self.lr_post  = nn.Sequential(nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64))
+        # PixelShuffle ×4: two ×2 stages
+        self.lr_up = nn.Sequential(
+            nn.Conv2d(64, 256, 3, padding=1), nn.PixelShuffle(2), nn.PReLU(),
+            nn.Conv2d(64, 256, 3, padding=1), nn.PixelShuffle(2), nn.PReLU(),
+        )  # output: (B, 64, H_hr, W_hr)
+
+        # --- History branch (operates at HR resolution) ---
+        # Input: warped HR(t-1) [3ch] + occlusion mask [1ch] = 4ch
+        self.hist_entry = nn.Sequential(nn.Conv2d(4, 64, 3, padding=1), nn.PReLU())
+        self.hist_res   = nn.Sequential(*[ResidualBlock(64) for _ in range(hist_res_blocks)])
+
+        # --- Fusion (at HR resolution) ---
+        self.fuse_entry = nn.Sequential(nn.Conv2d(128, 64, 3, padding=1), nn.PReLU())
+        self.fuse_res   = nn.Sequential(*[ResidualBlock(64) for _ in range(fuse_res_blocks)])
+        self.output     = nn.Conv2d(64, 3, 9, padding=4)
+
+    def forward(self, lr_curr, hr_prev, flow_lr):
+        """
+        lr_curr  : (B, 3, H_lr, W_lr) — current low-res frame
+        hr_prev  : (B, 3, H_hr, W_hr) — previous HR frame (GT during training, model output at inference)
+        flow_lr  : (B, 2)              — backward warp flow in LR pixel space
+        """
+        # Warp hr_prev at HR resolution (scale flow by scale_factor)
+        flow_hr = flow_lr * self.scale_factor
+        warped_hr, mask = backward_warp(hr_prev, flow_hr)
+
+        # LR branch → upsample to HR feature space
+        x = self.lr_entry(lr_curr)
+        x = x + self.lr_post(self.lr_res(x))
+        x = self.lr_up(x)                          # (B, 64, H_hr, W_hr)
+
+        # History branch
+        hist_in = torch.cat([warped_hr, mask], dim=1)  # (B, 4, H_hr, W_hr)
+        h = self.hist_entry(hist_in)
+        h = self.hist_res(h)                            # (B, 64, H_hr, W_hr)
+
+        # Fusion
+        f = self.fuse_entry(torch.cat([x, h], dim=1))  # (B, 64, H_hr, W_hr)
+        f = self.fuse_res(f)
+        return self.output(f)                           # (B, 3, H_hr, W_hr)
+
+
+if __name__ == "__main__":
+    model = RecurrentTSRNet(scale_factor=4)
+    lr = torch.randn(1, 3, 32, 32)
+    hr_prev = torch.randn(1, 3, 128, 128)
+    flow = torch.zeros(1, 2)
+    out = model(lr, hr_prev, flow)
+    print(f"LR: {lr.shape}, HR_prev: {hr_prev.shape} → HR_out: {out.shape}")

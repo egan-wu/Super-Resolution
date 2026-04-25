@@ -43,7 +43,8 @@ def generate_test_video(image_path, output_video, lr_size=(100, 100), frames=60)
     print("Test video generated successfully.")
 
 def run_video_inference(model_path, input_video, output_video, scale_factor=4):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    from utils import get_device
+    device = get_device()
     print(f"Using device: {device}")
 
     # Load Model
