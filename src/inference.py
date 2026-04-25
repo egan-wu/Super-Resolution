@@ -1,4 +1,5 @@
 import os
+import argparse
 import torch
 from torchvision import transforms
 from PIL import Image
@@ -87,9 +88,10 @@ def run_inference(model_path, image_path, output_path, scale_factor=4):
     print(f"Saved comparison to {output_path}")
 
 if __name__ == "__main__":
-    # Test inference on the first sample image we downloaded
-    checkpoint_file = "checkpoints/sr_model_epoch_5.pth"
-    test_image = "data/samples/sample_00.jpg"
-    output_result = "data/output_comparison.png"
+    parser = argparse.ArgumentParser(description="Run inference using trained Super-Resolution Model")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/sr_model_epoch_5.pth", help="Path to model checkpoint")
+    parser.add_argument("--image", type=str, default="data/samples/sample_00.jpg", help="Path to input image")
+    parser.add_argument("--output", type=str, default="assets/example_comparison.png", help="Path to save output comparison")
+    args = parser.parse_args()
 
-    run_inference(checkpoint_file, test_image, output_result)
+    run_inference(args.checkpoint, args.image, args.output)

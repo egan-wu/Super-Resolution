@@ -1,4 +1,5 @@
 import os
+import argparse
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -62,10 +63,15 @@ def train(num_epochs=10, batch_size=2, lr=1e-4, save_dir="checkpoints"):
         print(f"Epoch {epoch+1} Average Loss: {avg_loss:.4f}")
 
         # Save checkpoint periodically or at the end
-        if (epoch + 1) % 5 == 0 or (epoch + 1) == num_epochs:
+        if (epoch + 1) % 50 == 0 or (epoch + 1) == num_epochs:
             checkpoint_path = os.path.join(save_dir, f"sr_model_epoch_{epoch+1}.pth")
             torch.save(model.state_dict(), checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
 
 if __name__ == "__main__":
-    train(num_epochs=5, batch_size=2)
+    parser = argparse.ArgumentParser(description="Train the Super-Resolution Model")
+    parser.add_argument("--epochs", type=int, default=5, help="Number of training epochs")
+    parser.add_argument("--batch-size", type=int, default=2, help="Batch size for training")
+    args = parser.parse_args()
+
+    train(num_epochs=args.epochs, batch_size=args.batch_size)
