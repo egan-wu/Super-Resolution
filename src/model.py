@@ -2,110 +2,88 @@ import torch
 import torch.nn as nn
 
 class ResidualBlock(nn.Module):
-    """
-    Standard Residual Block as used in SRResNet.
-    """
     def __init__(self, channels):
         super(ResidualBlock, self).__init__()
         self.conv1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        self.relu = nn.PReLU()
+        self.bn1 = nn.BatchNorm2d(channels)
+        self.prelu = nn.PReLU()
         self.conv2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(channels)
 
     def forward(self, x):
-        residual = x
-        out = self.conv1(x)
-        out = self.relu(out)
-        out = self.conv2(out)
-        return out + residual
+        residual = self.conv1(x)
+        residual = self.bn1(residual)
+        residual = self.prelu(residual)
+        residual = self.conv2(residual)
+        residual = self.bn2(residual)
+        return x + residual
 
-class UpsampleBlock(nn.Module):
+class TemporalSRResNet(nn.Module):
     """
-    Upsampling Block using PixelShuffle.
-    Increases the spatial resolution by 2x.
+    Temporal Super-Resolution ResNet.
+    Accepts concatenated (Frame t-1, Frame t) as input (6 channels).
     """
-    def __init__(self, in_channels, up_scale=2):
-        super(UpsampleBlock, self).__init__()
-        # To upscale by 2x, we need 4x the channels (2^2) for PixelShuffle
-        self.conv = nn.Conv2d(in_channels, in_channels * (up_scale ** 2), kernel_size=3, padding=1)
-        self.pixel_shuffle = nn.PixelShuffle(up_scale)
-        self.relu = nn.PReLU()
+    def __init__(self, in_channels=6, num_res_blocks=16, scale_factor=4):
+        super(TemporalSRResNet, self).__init__()
 
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.pixel_shuffle(x)
-        x = self.relu(x)
-        return x
+        # Initial Feature Extraction (accepts 6 channels instead of 3)
+        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=9, padding=4)
+        self.prelu1 = nn.PReLU()
 
-class SRResNet(nn.Module):
-    """
-    A lightweight Super-Resolution ResNet model.
-    It takes a low-resolution image, extracts features, applies residual blocks,
-    and then upsamples the image to the target high resolution.
-    """
-    def __init__(self, scale_factor=4, num_channels=3, num_res_blocks=4, num_features=64):
-        super(SRResNet, self).__init__()
-
-        # Initial feature extraction
-        self.conv_in = nn.Sequential(
-            nn.Conv2d(num_channels, num_features, kernel_size=9, padding=4),
-            nn.PReLU()
+        # Residual Blocks
+        self.res_blocks = nn.Sequential(
+            *[ResidualBlock(64) for _ in range(num_res_blocks)]
         )
 
-        # Residual blocks
-        res_blocks = []
-        for _ in range(num_res_blocks):
-            res_blocks.append(ResidualBlock(num_features))
-        self.res_blocks = nn.Sequential(*res_blocks)
+        # Post-Residual Convolution
+        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)
 
-        # Post-residual convolution
-        self.conv_mid = nn.Sequential(
-            nn.Conv2d(num_features, num_features, kernel_size=3, padding=1),
-            nn.BatchNorm2d(num_features)
-        )
-
-        # Upsampling (Assuming scale_factor is 2, 4, or 8)
+        # Upsampling (PixelShuffle)
+        # For scale factor 4, we need two 2x upsampling blocks
         upsample_blocks = []
-        import math
-        if scale_factor in [2, 4, 8]:
-            num_upsample_blocks = int(math.log2(scale_factor))
-            for _ in range(num_upsample_blocks):
-                upsample_blocks.append(UpsampleBlock(num_features, up_scale=2))
-        else:
-            raise ValueError("Scale factor must be 2, 4, or 8")
+        for _ in range(2):
+            upsample_blocks.append(nn.Conv2d(64, 256, kernel_size=3, padding=1))
+            upsample_blocks.append(nn.PixelShuffle(2))
+            upsample_blocks.append(nn.PReLU())
 
-        self.upsample_blocks = nn.Sequential(*upsample_blocks)
+        self.upsample = nn.Sequential(*upsample_blocks)
 
-        # Final output layer to map back to 3 channels (RGB)
-        self.conv_out = nn.Conv2d(num_features, num_channels, kernel_size=9, padding=4)
+        # Final Output Layer (outputs 3 channels: RGB)
+        self.conv3 = nn.Conv2d(64, 3, kernel_size=9, padding=4)
 
-    def forward(self, x):
-        # Initial feature extraction
-        out1 = self.conv_in(x)
+    def forward(self, x_prev, x_curr):
+        # Concatenate temporal frames along the channel dimension
+        # Shape: (Batch, 3, H, W) + (Batch, 3, H, W) -> (Batch, 6, H, W)
+        x = torch.cat((x_prev, x_curr), dim=1)
 
-        # Residual blocks
+        # Extract features
+        out1 = self.prelu1(self.conv1(x))
+
+        # Deep residual processing
         res = self.res_blocks(out1)
-        res = self.conv_mid(res)
 
-        # Skip connection over the residual blocks
-        out2 = out1 + res
+        # Skip connection
+        out2 = self.bn2(self.conv2(res))
+        out = out1 + out2
 
-        # Upsampling
-        out = self.upsample_blocks(out2)
+        # Upscale
+        out = self.upsample(out)
 
-        # Final output
-        out = self.conv_out(out)
+        # Final image reconstruction
+        out = self.conv3(out)
 
-        # We can use torch.sigmoid to ensure outputs are between 0 and 1,
-        # or just let the loss function handle it. Since we are using standard tensors,
-        # we clamp/sigmoid it. Sigmoid helps keep it strictly in [0, 1] range of image tensors.
-        return torch.sigmoid(out)
+        # Ensure values stay roughly in valid range [0, 1] during initial training
+        # We can use sigmoid or just clamp later in inference. No strict activation here is typical.
+        return out
 
 if __name__ == "__main__":
-    # Test the model with dummy data
-    model = SRResNet(scale_factor=4)
-    # Batch Size 1, 3 Channels, 32x32 LR image
-    dummy_lr = torch.randn(1, 3, 32, 32)
-    output_hr = model(dummy_lr)
+    # Test model with dummy temporal input
+    model = TemporalSRResNet(scale_factor=4)
+    # Dummy tensors (Batch Size 1, Channels 3, Height 32, Width 32)
+    dummy_prev = torch.randn(1, 3, 32, 32)
+    dummy_curr = torch.randn(1, 3, 32, 32)
 
-    print(f"Input LR shape: {dummy_lr.shape}")
-    print(f"Output HR shape: {output_hr.shape}")
+    output = model(dummy_prev, dummy_curr)
+    print(f"Input Shape: Prev {dummy_prev.shape}, Curr {dummy_curr.shape}")
+    print(f"Output Shape: {output.shape}")
