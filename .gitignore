@@ -4,4 +4,5 @@ data/
 checkpoints/
 *.pth
 *.png
+!assets/*.png
 *.jpg
