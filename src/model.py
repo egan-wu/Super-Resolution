@@ -3,6 +3,32 @@ import torch.nn as nn
 import torch.nn.functional as F
 from warp import backward_warp
 
+
+# ---------------------------------------------------------------------------
+# ICNR Initialization (prevents PixelShuffle checkerboard artifacts)
+# ---------------------------------------------------------------------------
+
+def icnr_init(conv: nn.Conv2d, scale_factor: int = 2):
+    """
+    ICNR (Initialized to Convolution NearestResampled) initialization.
+    For the conv layer immediately before PixelShuffle(r):
+      - Creates a sub-kernel of shape (out_ch / r^2, in_ch, kH, kW)
+      - Initializes it with Kaiming normal
+      - Tiles it r^2 times along dim=0
+
+    Result: after PixelShuffle all r^2 sub-pixels share the same initial
+    weights → no systematic bias → no checkerboard pattern at epoch 0.
+    """
+    out_ch, in_ch, kH, kW = conv.weight.shape
+    sub_out = out_ch // (scale_factor ** 2)
+    tmp = torch.empty(sub_out, in_ch, kH, kW)
+    nn.init.kaiming_normal_(tmp, nonlinearity="relu")
+    kernel = tmp.repeat_interleave(scale_factor ** 2, dim=0)
+    conv.weight.data.copy_(kernel)
+    if conv.bias is not None:
+        nn.init.zeros_(conv.bias)
+
+
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
         super(ResidualBlock, self).__init__()
@@ -53,6 +79,12 @@ class TemporalSRResNet(nn.Module):
 
         # Final Output Layer (outputs 3 channels: RGB)
         self.conv3 = nn.Conv2d(64, 3, kernel_size=9, padding=4)
+        self._init_icnr()
+
+    def _init_icnr(self):
+        for module in self.upsample:
+            if isinstance(module, nn.Conv2d):
+                icnr_init(module, scale_factor=2)
 
     def forward(self, x_prev, x_curr):
         # Concatenate temporal frames along the channel dimension
@@ -113,6 +145,12 @@ class WarpTSRNet(nn.Module):
         self.upsample = nn.Sequential(*upsample_blocks)
 
         self.conv3 = nn.Conv2d(64, 3, kernel_size=9, padding=4)
+        self._init_icnr()
+
+    def _init_icnr(self):
+        for module in self.upsample:
+            if isinstance(module, nn.Conv2d):
+                icnr_init(module, scale_factor=2)
 
     def forward(self, x_prev, x_curr, flow):
         """
@@ -172,6 +210,12 @@ class RecurrentTSRNet(nn.Module):
         self.fuse_entry = nn.Sequential(nn.Conv2d(128, 64, 3, padding=1), nn.PReLU())
         self.fuse_res   = nn.Sequential(*[ResidualBlock(64) for _ in range(fuse_res_blocks)])
         self.output     = nn.Conv2d(64, 3, 9, padding=4)
+        self._init_icnr()
+
+    def _init_icnr(self):
+        for module in self.lr_up:
+            if isinstance(module, nn.Conv2d):
+                icnr_init(module, scale_factor=2)
 
     def forward(self, lr_curr, hr_prev, flow_lr):
         """

@@ -1,5 +1,6 @@
 import os
 import zipfile
+import tarfile
 import requests
 import random
 import numpy as np
@@ -36,18 +37,24 @@ class SRTemporalDataset(Dataset):
     """
     Generates frame pairs by simulating a panning camera over a high-res image.
     Returns: LR(t-1), LR(t), HR(t), backward-warp flow (LR pixel space)
+
+    `image_dirs` can be a single directory path (str) or a list of paths — all
+    images from every directory are merged into one flat pool.
     """
 
-    def __init__(self, image_dir, scale_factor=4, crop_size=128, max_offset=4):
-        self.image_dir = image_dir
+    def __init__(self, image_dirs, scale_factor=4, crop_size=128, max_offset=4):
+        if isinstance(image_dirs, str):
+            image_dirs = [image_dirs]
         self.scale_factor = scale_factor
         self.crop_size = crop_size
         self.max_offset = max_offset
 
-        self.image_filenames = [
-            os.path.join(image_dir, x) for x in os.listdir(image_dir)
-            if x.lower().endswith(('.png', '.jpg', '.jpeg'))
-        ]
+        self.image_filenames = []
+        for d in image_dirs:
+            self.image_filenames.extend([
+                os.path.join(d, x) for x in os.listdir(d)
+                if x.lower().endswith(('.png', '.jpg', '.jpeg'))
+            ])
         self.to_tensor = transforms.ToTensor()
 
     def __len__(self):
@@ -99,24 +106,34 @@ class SRSequenceDataset(Dataset):
     This is sub-pixel at LR scale (scale_factor=4 → 1 HR px = 0.25 LR px),
     giving the recurrent network diverse sub-pixel views to accumulate detail.
 
+    `image_dirs` can be a single directory path (str) or a list of paths — all
+    images from every directory are merged into one flat pool.
+
+    `seq_len` can be changed between epochs (for curriculum learning) by setting
+    dataset.seq_len = new_value before creating a new DataLoader.
+
     Returns (stacked tensors so DataLoader can batch directly):
         lr_seq   : (T, 3, H_lr, W_lr)
         hr_seq   : (T, 3, H_hr, W_hr)
         flow_seq : (T, 2)  — LR-pixel backward warp flow; flow[0] = (0,0) (no prev)
     """
 
-    def __init__(self, image_dir, scale_factor=4, crop_size=128,
+    def __init__(self, image_dirs, scale_factor=4, crop_size=128,
                  max_offset=8, seq_len=4, use_jitter=True):
+        if isinstance(image_dirs, str):
+            image_dirs = [image_dirs]
         self.scale_factor = scale_factor
         self.crop_size = crop_size
         self.max_offset = max_offset
         self.seq_len = seq_len
         self.use_jitter = use_jitter
 
-        self.image_filenames = [
-            os.path.join(image_dir, x) for x in os.listdir(image_dir)
-            if x.lower().endswith(('.png', '.jpg', '.jpeg'))
-        ]
+        self.image_filenames = []
+        for d in image_dirs:
+            self.image_filenames.extend([
+                os.path.join(d, x) for x in os.listdir(d)
+                if x.lower().endswith(('.png', '.jpg', '.jpeg'))
+            ])
         self.to_tensor = transforms.ToTensor()
 
         lr_size = crop_size // scale_factor
@@ -245,6 +262,56 @@ def download_div2k(output_dir="data/div2k", split="valid", max_images=100):
 
     extracted = len([f for f in os.listdir(output_dir) if f.lower().endswith(".png")])
     print(f"DIV2K {split}: {extracted} images ready in {output_dir}")
+
+
+def download_flickr2k(output_dir="data/flickr2k"):
+    """
+    Downloads the Flickr2K HR dataset (~2650 images, ~3.2 GB tar).
+    Source: SNU EDSR mirror (Creative Commons licensed Flickr images).
+
+    Combined with DIV2K this gives ~3450 training images — the standard
+    SR research corpus used by EDSR, BasicVSR, etc.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    existing = [f for f in os.listdir(output_dir)
+                if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+    if len(existing) >= 100:          # rough sanity check
+        print(f"Flickr2K already ready ({len(existing)} images in {output_dir}).")
+        return
+
+    url      = "https://cv.snu.ac.kr/research/EDSR/Flickr2K.tar"
+    tar_path = os.path.join("data", "Flickr2K.tar")
+
+    if not os.path.exists(tar_path):
+        print(f"Downloading Flickr2K from {url}  (~3.2 GB, may take a while...)")
+        try:
+            resp = requests.get(url, stream=True, timeout=30)
+            resp.raise_for_status()
+            total = int(resp.headers.get("content-length", 0))
+            with open(tar_path, "wb") as f, tqdm(
+                total=total, unit="B", unit_scale=True, desc="Flickr2K.tar"
+            ) as bar:
+                for chunk in resp.iter_content(chunk_size=1 << 20):
+                    f.write(chunk)
+                    bar.update(len(chunk))
+        except Exception as e:
+            print(f"Download failed: {e}")
+            print("You can manually download Flickr2K.tar from:")
+            print("  https://cv.snu.ac.kr/research/EDSR/Flickr2K.tar")
+            print(f"and place it at:  {tar_path}")
+            return
+
+    print(f"Extracting Flickr2K to {output_dir} ...")
+    with tarfile.open(tar_path, "r") as tf:
+        members = [m for m in tf.getmembers()
+                   if m.name.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        for member in tqdm(members, desc="Extracting Flickr2K"):
+            member.name = os.path.basename(member.name)   # flatten dirs
+            tf.extract(member, output_dir)
+
+    extracted = len([f for f in os.listdir(output_dir)
+                     if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+    print(f"Flickr2K: {extracted} images ready in {output_dir}")
 
 
 def download_sample_images(output_dir="data/samples", num_images=5):

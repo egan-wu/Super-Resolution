@@ -41,18 +41,27 @@ pip install torch torchvision pillow requests tqdm matplotlib opencv-python scik
 
 ### Option A — Quick start (5 sample images, auto-downloaded)
 
-The training script downloads 5 Unsplash images automatically if no `--div2k` flag is given.
+The training script downloads 5 Unsplash images automatically if no dataset flag is given.
 
-### Option B — DIV2K (recommended)
+### Option B — DIV2K (recommended minimum)
 
 [DIV2K](https://data.vision.ee.ethz.ch/cvl/DIV2K/) is the standard SR benchmark. The `--div2k` flag downloads the **validation set** (100 high-resolution images, ~770 MB) automatically on first run.
 
 ```bash
-# Downloads DIV2K on first use, then trains
 python src/train.py --phase 3 --div2k --epochs 5000
 ```
 
-If you already have a local dataset directory, use `--data-dir`:
+### Option C — DIV2K + Flickr2K (best quality)
+
+[Flickr2K](https://cv.snu.ac.kr/research/EDSR/Flickr2K.tar) (~2650 images, ~3.2 GB) is the companion corpus used by EDSR, BasicVSR, and most modern SR models. Combined with DIV2K it gives ~3450 training images.
+
+```bash
+python src/train.py --phase 3 --div2k --flickr2k --epochs 5000
+```
+
+Both datasets are downloaded automatically. If Flickr2K download fails, download `Flickr2K.tar` manually and place it at `data/Flickr2K.tar`.
+
+### Option D — Custom directory
 
 ```bash
 python src/train.py --phase 3 --data-dir /path/to/images --epochs 5000
@@ -68,19 +77,31 @@ All three phases share a single training script.
 python src/train.py --phase <1|2|3> [options]
 ```
 
-### Options
+### Core options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--phase` | `3` | Which architecture to train (1, 2, or 3) |
+| `--phase` | `3` | Architecture to train (1, 2, or 3) |
 | `--epochs` | `5000` | Number of training epochs |
-| `--batch-size` | `4` | Batch size (`8` recommended with DIV2K) |
+| `--batch-size` | `4` | Batch size |
 | `--lr` | `1e-4` | Learning rate |
-| `--val-every` | `500` | Run validation and save checkpoint every N epochs |
-| `--seq-len` | `4` | Sequence length for Phase 3 (ignored by Phase 1/2) |
-| `--div2k` | off | Download and use DIV2K validation HR dataset |
-| `--data-dir` | `""` | Custom image directory (overrides `--div2k`) |
-| `--save-dir` | `checkpoints` | Directory to save checkpoints |
+| `--val-every` | `500` | Validate and save checkpoint every N epochs |
+| `--seq-len` | `4` | Initial sequence length (Phase 3 only) |
+| `--save-dir` | `checkpoints` | Checkpoint output directory |
+| `--div2k` | off | Download and use DIV2K validation HR (100 images) |
+| `--flickr2k` | off | Download and use Flickr2K HR (~2650 images) |
+| `--data-dir` | `""` | Custom image directory (overrides `--div2k`/`--flickr2k`) |
+
+### Phase 3 enhancement options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--sched-sampling` | off | Enable scheduled sampling to fix exposure bias |
+| `--sched-sample-ramp` | `2000` | Epochs to ramp self-feedback probability 0 → 0.9 |
+| `--curriculum` | off | Progressive seq_len: 4 → 6 → 8 across training |
+| `--temp-loss-weight` | `0.0` | Temporal consistency loss weight (try 0.05–0.2) |
+| `--grad-clip` | `1.0` | Max gradient norm (0 = disabled) |
+| `--grad-accum` | `1` | Gradient accumulation steps (OOM workaround) |
 
 ### Examples
 
@@ -91,8 +112,19 @@ python src/train.py --phase 1 --epochs 5000 --batch-size 8 --div2k
 # Phase 2 — Warp-then-Fuse
 python src/train.py --phase 2 --epochs 5000 --batch-size 8 --div2k
 
-# Phase 3 — Recurrent DLSS-style (recommended)
+# Phase 3 — Basic (same as before)
 python src/train.py --phase 3 --epochs 5000 --batch-size 4 --div2k --seq-len 4
+
+# Phase 3 — Full enhanced config (recommended)
+python src/train.py --phase 3 --epochs 5000 --batch-size 4 \
+    --div2k --flickr2k \
+    --sched-sampling --curriculum \
+    --temp-loss-weight 0.1 --grad-clip 1.0
+
+# Phase 3 — OOM fallback (simulate batch-size 8 with 1 GPU sample at a time)
+python src/train.py --phase 3 --epochs 5000 \
+    --batch-size 1 --grad-accum 8 \
+    --div2k --sched-sampling --curriculum --temp-loss-weight 0.1
 ```
 
 ### Checkpoints
@@ -148,18 +180,91 @@ This runs true recurrent inference: the model feeds its own HR output back as hi
 
 ---
 
-## Video Inference (Phase 1 / 2)
+## Video Inference
 
-Generate a panning low-resolution video from an image, then upscale it frame-by-frame:
+All three phases support frame-by-frame video upscaling. The output is a side-by-side comparison: **Bicubic** (left) vs **SR output** (right).
 
-```bash
-python src/video_inference.py \
-  --checkpoint checkpoints/p2_best.pth \
-  --image_source data/samples/sample_00.jpg \
-  --output_video assets/upscaled.mp4
+### How motion is estimated on real video
+
+For Phase 2 and 3, the model needs motion vectors between frames. On real video, these are estimated automatically using **OpenCV Farneback dense optical flow** — no game engine or synthetic data needed.
+
+```
+Frame t-1 ──┐
+             ├─► Farneback optical flow ─► dense flow (H×W×2)
+Frame t   ──┘         │
+                       ▼
+              backward_warp(Frame t-1, flow) ─► aligned history
 ```
 
-Outputs a side-by-side comparison video: **Bicubic** (left) vs **SR output** (right).
+Phase 1 uses early fusion (no flow estimation needed).
+
+### Test video sources
+
+**Option A — Download an open-source video automatically:**
+
+```bash
+python -c "
+import sys; sys.path.insert(0, 'src')
+from dataset import download_test_video
+download_test_video('data/test_video.mp4', resolution='360')
+"
+```
+
+This tries the following sources in order (all Creative Commons):
+- [Big Buck Bunny](https://peach.blender.org/) — Blender Foundation
+- [Sintel trailer](https://durian.blender.org/) — Blender Foundation
+- Falls back to generating a synthetic panning video from `data/samples/sample_00.jpg`
+
+**Option B — Use any local video:**
+
+Any `.mp4` file works. For best results use a clean, low-compression source at a resolution divisible by the scale factor (4).
+
+Recommended: [Blender Open Movies](https://download.blender.org/peach/bigbuckbunny_movies/) · [Xiph.org test media](https://media.xiph.org/video/derf/)
+
+### Usage
+
+```bash
+python src/video_inference.py --phase <1|2|3> [options]
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--phase` | `2` | Which model to use (1 = no flow, 2 = Farneback+warp, 3 = Farneback+recurrent) |
+| `--checkpoint` | `checkpoints/p2_best.pth` | Path to model checkpoint |
+| `--input-video` | *(auto-generate)* | Path to input LR video; omit to use synthetic fallback |
+| `--output-video` | `assets/video_sr_output.mp4` | Output side-by-side comparison video |
+| `--image-source` | `data/samples/sample_00.jpg` | HR image for synthetic video generation (fallback only) |
+| `--lr-width` | `320` | Width of synthetic LR video (fallback only) |
+| `--lr-height` | `240` | Height of synthetic LR video (fallback only) |
+| `--frames` | `120` | Number of frames for synthetic video (fallback only) |
+
+### Examples
+
+```bash
+# Phase 1 — no optical flow (fastest)
+python src/video_inference.py \
+  --phase 1 \
+  --checkpoint checkpoints/p1_best.pth \
+  --input-video data/test_video.mp4 \
+  --output-video assets/video_p1.mp4
+
+# Phase 2 — Farneback flow + warp (recommended for real video)
+python src/video_inference.py \
+  --phase 2 \
+  --checkpoint checkpoints/p2_best.pth \
+  --input-video data/test_video.mp4 \
+  --output-video assets/video_p2.mp4
+
+# Phase 3 — Farneback flow + recurrent HR feedback (best quality, slowest)
+python src/video_inference.py \
+  --phase 3 \
+  --checkpoint checkpoints/p3_best.pth \
+  --input-video data/test_video.mp4 \
+  --output-video assets/video_p3.mp4
+
+# No input video — auto-generates synthetic panning clip from an image
+python src/video_inference.py --phase 2 --checkpoint checkpoints/p2_best.pth
+```
 
 ---
 
@@ -182,16 +287,26 @@ Phase 2 nearly matches Bicubic on a still-image test; Phase 3 shows its advantag
 
 ```
 src/
-  dataset.py       — SRTemporalDataset (Phase 1/2), SRSequenceDataset (Phase 3), DIV2K downloader
-  model.py         — TemporalSRResNet, WarpTSRNet, RecurrentTSRNet
-  warp.py          — backward_warp() using grid_sample + occlusion mask
-  utils.py         — get_device() (CUDA→MPS→CPU), compute_psnr(), compute_ssim()
-  train.py         — unified training script (--phase 1/2/3)
-  inference.py     — image inference with PSNR/SSIM output
-  video_inference.py — frame-by-frame video upscaling
+  dataset.py        — SRTemporalDataset (Phase 1/2), SRSequenceDataset + Halton jitter (Phase 3)
+                      Both accept single dir or list of dirs (multi-dataset support)
+                      download_sample_images(), download_div2k(), download_flickr2k(),
+                      download_test_video()
+  model.py          — TemporalSRResNet (P1), WarpTSRNet (P2), RecurrentTSRNet (P3)
+                      All models use ICNR initialization on PixelShuffle layers
+  warp.py           — backward_warp(): grid_sample + occlusion mask
+                      supports rigid (B,2) and dense (B,2,H,W) flow
+  utils.py          — get_device() (CUDA→MPS→CPU), compute_psnr(), compute_ssim()
+  train.py          — unified training script (--phase 1/2/3)
+                      Phase 3: Charbonnier loss, temporal consistency loss,
+                      scheduled sampling, curriculum seq_len, grad clipping/accumulation
+  inference.py      — image inference with PSNR/SSIM output (--phase 1/2/3)
+  video_inference.py — video SR with Farneback optical flow (--phase 1/2/3)
 
-checkpoints/       — saved model weights
-data/samples/      — auto-downloaded sample images
-data/div2k/        — DIV2K HR images (created on first --div2k run)
-assets/            — output comparison images and training logs
+checkpoints/        — saved model weights (p1_best.pth, p2_best.pth, p3_best.pth)
+data/samples/       — auto-downloaded sample images (5 Unsplash photos)
+data/div2k/         — DIV2K HR images (created on first --div2k run, ~770 MB)
+data/flickr2k/      — Flickr2K HR images (created on first --flickr2k run, ~3.2 GB)
+data/test_video.mp4 — test video (downloaded or synthetic)
+assets/             — output comparison images and training logs
+revision_history.md — detailed log of all architectural changes and their rationale
 ```
