@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from warp import backward_warp
 
 class ResidualBlock(nn.Module):
@@ -176,10 +177,20 @@ class RecurrentTSRNet(nn.Module):
         """
         lr_curr  : (B, 3, H_lr, W_lr) — current low-res frame
         hr_prev  : (B, 3, H_hr, W_hr) — previous HR frame (GT during training, model output at inference)
-        flow_lr  : (B, 2)              — backward warp flow in LR pixel space
+        flow_lr  : (B, 2)              — rigid backward flow in LR pixel space  [synthetic training]
+               OR (B, 2, H_lr, W_lr)  — dense backward flow from Farneback     [real video]
         """
-        # Warp hr_prev at HR resolution (scale flow by scale_factor)
-        flow_hr = flow_lr * self.scale_factor
+        s = self.scale_factor
+
+        if flow_lr.dim() == 2:
+            # Rigid flow: scale scalar displacement to HR pixel space
+            flow_hr = flow_lr * s                                            # (B, 2)
+        else:
+            # Dense flow: upsample spatial dims AND scale values to HR pixel space
+            flow_hr = F.interpolate(
+                flow_lr, scale_factor=s, mode="bilinear", align_corners=False
+            ) * s                                                            # (B, 2, H_hr, W_hr)
+
         warped_hr, mask = backward_warp(hr_prev, flow_hr)
 
         # LR branch → upsample to HR feature space

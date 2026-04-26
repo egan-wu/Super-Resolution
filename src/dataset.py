@@ -2,6 +2,7 @@ import os
 import zipfile
 import requests
 import random
+import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
@@ -263,6 +264,96 @@ def download_sample_images(output_dir="data/samples", num_images=5):
             with open(filepath, 'wb') as f:
                 f.write(response.content)
     print(f"Sample images ready in {output_dir}")
+
+
+def download_test_video(output_path="data/test_video.mp4", resolution="360"):
+    """
+    Downloads a short, clean open-source video for SR evaluation.
+
+    Sources (tried in order):
+      1. Big Buck Bunny — official Blender Foundation CDN
+      2. Sintel trailer  — official Blender Foundation CDN
+      3. Fallback        — generates a synthetic panning video from sample_00.jpg
+
+    Args:
+        output_path : destination .mp4 file
+        resolution  : "360" | "480" | "720"  (hint only; actual res depends on source)
+    """
+    import subprocess
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    if os.path.exists(output_path):
+        print(f"Test video already exists: {output_path}")
+        return
+
+    # Curated open-source video URLs (clean, no compression artifacts)
+    sources = {
+        "360": [
+            # Big Buck Bunny – Blender Foundation (Creative Commons)
+            "https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_360p_h264.mov",
+            # Elephants Dream – Blender Foundation
+            "https://download.blender.org/ED/ed_1024_512.avi",
+        ],
+        "480": [
+            "https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_480p_h264.mov",
+            "https://download.blender.org/durian/movies/sintel_trailer-480p.mp4",
+        ],
+        "720": [
+            "https://download.blender.org/peach/bigbuckbunny_movies/big_buck_bunny_720p_h264.mov",
+            "https://download.blender.org/durian/movies/sintel_trailer-720p.mp4",
+        ],
+    }
+    urls = sources.get(resolution, sources["360"])
+
+    for url in urls:
+        print(f"Trying: {url}")
+        try:
+            resp = requests.get(url, stream=True, timeout=10)
+            resp.raise_for_status()
+            total = int(resp.headers.get("content-length", 0))
+            with open(output_path, "wb") as f, tqdm(
+                total=total, unit="B", unit_scale=True, desc=os.path.basename(output_path)
+            ) as bar:
+                for chunk in resp.iter_content(chunk_size=1 << 20):
+                    f.write(chunk)
+                    bar.update(len(chunk))
+            print(f"Downloaded: {output_path}")
+            return
+        except Exception as e:
+            print(f"  Failed: {e}")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+
+    # Fallback: generate synthetic panning video from sample images
+    print("All URLs failed — generating synthetic panning video from sample images...")
+    download_sample_images()
+    _generate_synthetic_video(output_path)
+
+
+def _generate_synthetic_video(output_path, image_path="data/samples/sample_00.jpg",
+                               lr_size=(320, 240), frames=120, fps=30):
+    """Create a panning LR video from a single HR image (fallback)."""
+    try:
+        import cv2
+    except ImportError:
+        print("opencv-python not installed — cannot generate synthetic video.")
+        return
+
+    img = Image.open(image_path).convert("RGB")
+    w, h = img.size
+    window = min(w, h) - 10
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(output_path, fourcc, fps, lr_size)
+    for i in range(frames):
+        t  = i / max(frames - 1, 1)
+        px = int(t * (w - window))
+        py = int(t * (h - window))
+        crop = img.crop((px, py, px + window, py + window))
+        frame = crop.resize(lr_size, Image.Resampling.BICUBIC)
+        writer.write(cv2.cvtColor(np.array(frame), cv2.COLOR_RGB2BGR))
+    writer.release()
+    print(f"Synthetic video saved: {output_path}")
 
 
 if __name__ == "__main__":
