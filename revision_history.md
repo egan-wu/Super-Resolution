@@ -4,6 +4,99 @@ A concise record of each improvement round, its motivation, approach, and core i
 
 ---
 
+## Anti-Striping Round (2026-04-30)
+
+Addresses the **black-grid / striping artefact** observed in Phase 3 outputs after
+val-PSNR climbed past ~30 dB on DIV2K + Flickr2K. Root cause analysis (architectural):
+the model was finding the **cheapest mathematical shortcut** to push PSNR — regular
+high-frequency oscillations on the PixelShuffle sub-pixel grid — instead of true
+high-frequency detail.
+
+Two changes target this directly.
+
+---
+
+### 9. Post-shuffle Smoothing Conv (`src/model.py`)
+
+**Problem:** ICNR initialisation only ensures the *initial* state of the four
+sub-pixel kernels is symmetric. As training proceeds the kernels drift apart,
+and any persistent asymmetry produces a regular checkerboard / striping pattern
+that PSNR actually *rewards* (it counts as legitimate high-frequency energy).
+
+**Fix:** After each `PixelShuffle(2)` insert a lightweight 3×3 conv:
+```
+Conv2d(64, 256, 3) → PixelShuffle(2) → Conv2d(64, 64, 3) → PReLU
+                                       ^^^ NEW post-smooth ^^^
+```
+The smooth conv blends the four sub-pixels of every 2×2 output tile, so any
+sub-pixel imbalance gets averaged away before it propagates further.
+
+**Key choices:**
+- 3×3 kernel: enough receptive field to mix all four sub-pixels plus a small
+  neighbourhood; 1×1 would only re-weight per-pixel and can't truly smooth.
+- Kept 64→64 channels: no capacity blow-up.
+- ICNR is *only* applied to the conv immediately before each PixelShuffle.
+  The new smoothing convs use default Kaiming init (they're not the symmetry
+  bottleneck).
+- Applied to `TemporalSRResNet` (P1), `WarpTSRNet` (P2) and
+  `RecurrentTSRNet` (P3) — all three use PixelShuffle.
+
+**Core idea:** Treat PixelShuffle as a *signal-processing* step, not a learning
+step. Add an explicit anti-aliasing layer right after sub-pixel rearrangement
+so checkerboard patterns are absorbed before they ever reach the loss.
+
+⚠️ **Architecture change** — old checkpoints (without the smoothing conv)
+cannot be loaded into the new model.
+
+---
+
+### 10. Total Variation (TV) Loss (`src/train.py`)
+
+**Problem:** Pixel-wise loss alone (Charbonnier / MSE) is *agnostic* to the
+*pattern* of error. A regular striping pattern and a smooth gradient with the
+same MSE look identical to the loss — but only one is what we want.
+
+**Fix:** Added `tv_loss(x)` (anisotropic L1 form):
+```
+L_TV = mean(|x[i+1,j] − x[i,j]|) + mean(|x[i,j+1] − x[i,j]|)
+```
+A small weighted TV term is added to the per-frame pixel loss in all three
+phases:
+```
+loss = pixel_loss + tv_loss_weight * L_TV(out)   [+ temp_loss for P3]
+```
+
+**Key choices:**
+- **L1 form (not L2):** L2 over-penalises real edges; L1 only suppresses
+  high-frequency *low-amplitude* oscillation, which is exactly the striping.
+- **Recommended weight 1e-6 to 1e-4:** below this no effect, above ~1e-3
+  outputs become visibly soft. Default 0.0 (opt-in).
+- **Applies to all phases:** PixelShuffle striping is an architecture-level
+  problem, not Phase-3-specific.
+- Controlled by `--tv-loss-weight` (e.g. `--tv-loss-weight 1e-5`).
+
+**Core idea:** Pattern-aware regularisation. Make "smooth" cheaper than
+"striped" in loss space, so the model can no longer exploit the
+sub-pixel-grid shortcut to inflate PSNR.
+
+---
+
+### Recommended config for retraining (anti-striping)
+
+```bash
+python src/train.py --phase 3 --epochs 600 \
+    --batch-size 4 --seq-len 4 --div2k --flickr2k \
+    --sched-sampling --curriculum \
+    --temp-loss-weight 0.1 \
+    --tv-loss-weight  1e-5 \
+    --grad-clip 1.0
+```
+
+Start TV weight at `1e-5`. If striping still visible after ~300 epochs, raise
+to `5e-5`. If output looks washed out, drop to `1e-6` or disable.
+
+---
+
 ## Phase 3 Enhancement (2026-04-26)
 
 Addresses two main failure modes observed in Phase 3:
@@ -164,3 +257,5 @@ causes high validation variance and poor PSNR on unseen content.
 | Gradient accumulation | `train.py` | `--grad-accum 4` |
 | ICNR init | `model.py` | (always on) |
 | Multi-dir + Flickr2K | `dataset.py`, `train.py` | `--flickr2k` |
+| Post-shuffle smoothing conv | `model.py` | (always on, all phases) |
+| Total Variation (TV) loss | `train.py` | `--tv-loss-weight 1e-5` |

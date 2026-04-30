@@ -67,12 +67,16 @@ class TemporalSRResNet(nn.Module):
         self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
 
-        # Upsampling (PixelShuffle)
-        # For scale factor 4, we need two 2x upsampling blocks
+        # Upsampling (PixelShuffle + post-smooth)
+        # For scale factor 4, two 2× stages.
+        # Each stage: pre-shuffle conv (ICNR init) → PixelShuffle → smooth conv → PReLU
+        # The smooth conv "tidies up" the rearranged sub-pixels, suppressing
+        # checkerboard / striping artefacts (expert tip — anti-aliasing post-shuffle).
         upsample_blocks = []
         for _ in range(2):
-            upsample_blocks.append(nn.Conv2d(64, 256, kernel_size=3, padding=1))
+            upsample_blocks.append(nn.Conv2d(64, 256, kernel_size=3, padding=1))  # ICNR
             upsample_blocks.append(nn.PixelShuffle(2))
+            upsample_blocks.append(nn.Conv2d(64, 64, kernel_size=3, padding=1))   # smooth
             upsample_blocks.append(nn.PReLU())
 
         self.upsample = nn.Sequential(*upsample_blocks)
@@ -82,9 +86,13 @@ class TemporalSRResNet(nn.Module):
         self._init_icnr()
 
     def _init_icnr(self):
-        for module in self.upsample:
-            if isinstance(module, nn.Conv2d):
-                icnr_init(module, scale_factor=2)
+        # Only ICNR-init the Conv2d immediately *before* a PixelShuffle.
+        # The post-shuffle smoothing convs use default Kaiming init.
+        modules = list(self.upsample)
+        for i, m in enumerate(modules):
+            if isinstance(m, nn.Conv2d) and i + 1 < len(modules) \
+                    and isinstance(modules[i + 1], nn.PixelShuffle):
+                icnr_init(m, scale_factor=2)
 
     def forward(self, x_prev, x_curr):
         # Concatenate temporal frames along the channel dimension
@@ -137,10 +145,12 @@ class WarpTSRNet(nn.Module):
         self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(64)
 
+        # PixelShuffle ×4 with post-shuffle smoothing convs (anti-checkerboard)
         upsample_blocks = []
         for _ in range(2):  # 2x * 2x = 4x
-            upsample_blocks.append(nn.Conv2d(64, 256, kernel_size=3, padding=1))
+            upsample_blocks.append(nn.Conv2d(64, 256, kernel_size=3, padding=1))  # ICNR
             upsample_blocks.append(nn.PixelShuffle(2))
+            upsample_blocks.append(nn.Conv2d(64, 64, kernel_size=3, padding=1))   # smooth
             upsample_blocks.append(nn.PReLU())
         self.upsample = nn.Sequential(*upsample_blocks)
 
@@ -148,9 +158,11 @@ class WarpTSRNet(nn.Module):
         self._init_icnr()
 
     def _init_icnr(self):
-        for module in self.upsample:
-            if isinstance(module, nn.Conv2d):
-                icnr_init(module, scale_factor=2)
+        modules = list(self.upsample)
+        for i, m in enumerate(modules):
+            if isinstance(m, nn.Conv2d) and i + 1 < len(modules) \
+                    and isinstance(modules[i + 1], nn.PixelShuffle):
+                icnr_init(m, scale_factor=2)
 
     def forward(self, x_prev, x_curr, flow):
         """
@@ -195,10 +207,13 @@ class RecurrentTSRNet(nn.Module):
         self.lr_entry = nn.Sequential(nn.Conv2d(3, 64, 9, padding=4), nn.PReLU())
         self.lr_res   = nn.Sequential(*[ResidualBlock(64) for _ in range(lr_res_blocks)])
         self.lr_post  = nn.Sequential(nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64))
-        # PixelShuffle ×4: two ×2 stages
+        # PixelShuffle ×4: two ×2 stages, each followed by a smoothing conv
+        # to suppress checkerboard / striping artefacts on the sub-pixel grid.
         self.lr_up = nn.Sequential(
-            nn.Conv2d(64, 256, 3, padding=1), nn.PixelShuffle(2), nn.PReLU(),
-            nn.Conv2d(64, 256, 3, padding=1), nn.PixelShuffle(2), nn.PReLU(),
+            nn.Conv2d(64, 256, 3, padding=1), nn.PixelShuffle(2),     # pre-shuffle (ICNR)
+            nn.Conv2d(64,  64, 3, padding=1), nn.PReLU(),             # post-shuffle smooth
+            nn.Conv2d(64, 256, 3, padding=1), nn.PixelShuffle(2),     # pre-shuffle (ICNR)
+            nn.Conv2d(64,  64, 3, padding=1), nn.PReLU(),             # post-shuffle smooth
         )  # output: (B, 64, H_hr, W_hr)
 
         # --- History branch (operates at HR resolution) ---
@@ -213,9 +228,13 @@ class RecurrentTSRNet(nn.Module):
         self._init_icnr()
 
     def _init_icnr(self):
-        for module in self.lr_up:
-            if isinstance(module, nn.Conv2d):
-                icnr_init(module, scale_factor=2)
+        # Only ICNR-init the Conv2d immediately *before* a PixelShuffle.
+        # Post-shuffle smoothing convs use default Kaiming init.
+        modules = list(self.lr_up)
+        for i, m in enumerate(modules):
+            if isinstance(m, nn.Conv2d) and i + 1 < len(modules) \
+                    and isinstance(modules[i + 1], nn.PixelShuffle):
+                icnr_init(m, scale_factor=2)
 
     def forward(self, lr_curr, hr_prev, flow_lr):
         """

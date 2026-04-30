@@ -103,6 +103,20 @@ python src/train.py --phase <1|2|3> [options]
 | `--grad-clip` | `1.0` | Max gradient norm (0 = disabled) |
 | `--grad-accum` | `1` | Gradient accumulation steps (OOM workaround) |
 
+### Anti-striping options (all phases)
+
+PixelShuffle is prone to producing regular checkerboard / striping artefacts
+once PSNR is being optimised aggressively. Two architectural changes target
+this directly: a **post-shuffle smoothing conv** (always on, baked into the
+model) and a **Total Variation (TV) loss** (opt-in via flag).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--tv-loss-weight` | `0.0` | TV loss weight to suppress checkerboard. Recommended `1e-5`; tune in `[1e-6, 1e-4]`. Applies to all phases. |
+
+> ⚠️ The post-shuffle smoothing conv is an **architectural change** — checkpoints
+> trained before this change cannot be loaded into the new model. Retrain from scratch.
+
 ### Examples
 
 ```bash
@@ -121,11 +135,34 @@ python src/train.py --phase 3 --epochs 5000 --batch-size 4 \
     --sched-sampling --curriculum \
     --temp-loss-weight 0.1 --grad-clip 1.0
 
+# Phase 3 — Anti-striping config (recommended after this update)
+python src/train.py --phase 3 --epochs 5000 --batch-size 4 \
+    --div2k --flickr2k \
+    --sched-sampling --curriculum \
+    --temp-loss-weight 0.1 \
+    --tv-loss-weight  1e-5 \
+    --grad-clip 1.0
+
+# Phase 3 — Quick local smoke test (~1–2 h on RTX 3050 8 GB)
+python src/train.py --phase 3 --epochs 100 \
+    --batch-size 2 --seq-len 4 --div2k \
+    --sched-sampling --sched-sample-ramp 50 --curriculum \
+    --temp-loss-weight 0.1 --tv-loss-weight 1e-5 \
+    --grad-clip 1.0 --val-every 20
+
 # Phase 3 — OOM fallback (simulate batch-size 8 with 1 GPU sample at a time)
 python src/train.py --phase 3 --epochs 5000 \
     --batch-size 1 --grad-accum 8 \
     --div2k --sched-sampling --curriculum --temp-loss-weight 0.1
 ```
+
+### TV loss tuning
+
+| Observation after ~300 epochs | Action |
+|-------------------------------|--------|
+| Striping / black grid still visible | Raise `--tv-loss-weight` to `5e-5` or `1e-4` |
+| Output looks washed out / soft | Lower to `1e-6` or remove the flag |
+| Looks clean, edges preserved | Keep `1e-5` |
 
 ### Checkpoints
 
@@ -292,13 +329,16 @@ src/
                       download_sample_images(), download_div2k(), download_flickr2k(),
                       download_test_video()
   model.py          — TemporalSRResNet (P1), WarpTSRNet (P2), RecurrentTSRNet (P3)
-                      All models use ICNR initialization on PixelShuffle layers
+                      All models use ICNR initialization on the conv before each
+                      PixelShuffle, plus a post-shuffle smoothing conv to
+                      suppress checkerboard / striping artefacts
   warp.py           — backward_warp(): grid_sample + occlusion mask
                       supports rigid (B,2) and dense (B,2,H,W) flow
   utils.py          — get_device() (CUDA→MPS→CPU), compute_psnr(), compute_ssim()
   train.py          — unified training script (--phase 1/2/3)
                       Phase 3: Charbonnier loss, temporal consistency loss,
                       scheduled sampling, curriculum seq_len, grad clipping/accumulation
+                      All phases: Total Variation (TV) loss via --tv-loss-weight
   inference.py      — image inference with PSNR/SSIM output (--phase 1/2/3)
   video_inference.py — video SR with Farneback optical flow (--phase 1/2/3)
 

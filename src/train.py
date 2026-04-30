@@ -48,6 +48,25 @@ def charbonnier_loss(pred: torch.Tensor, target: torch.Tensor,
     return torch.sqrt(diff * diff + eps * eps).mean()
 
 
+def tv_loss(x: torch.Tensor) -> torch.Tensor:
+    """
+    Total Variation (TV) loss — anisotropic L1 form:
+        L_TV = mean( |x[i+1,j] - x[i,j]| ) + mean( |x[i,j+1] - x[i,j]| )
+
+    Penalises abrupt pixel-to-pixel jumps. The PixelShuffle checkerboard /
+    striping artefact is exactly that — a regular high-frequency oscillation
+    on the sub-pixel grid — so a small TV weight strongly suppresses it
+    without softening real edges (those are infrequent isolated jumps,
+    while artefacts are dense regular patterns).
+
+    Recommended weight: 1e-6 to 1e-3 (start at 1e-5 and tune).
+    Too high → blurry output; too low → no effect.
+    """
+    diff_h = torch.abs(x[:, :, 1:, :] - x[:, :, :-1, :])
+    diff_w = torch.abs(x[:, :, :, 1:] - x[:, :, :, :-1])
+    return diff_h.mean() + diff_w.mean()
+
+
 def temporal_consistency_loss(out_curr: torch.Tensor,
                                out_prev: torch.Tensor,
                                flow_lr: torch.Tensor,
@@ -224,6 +243,8 @@ def train_phase1(args, device, train_loader, val_loader):
                 lr_prev.to(device), lr_curr.to(device), hr_curr.to(device))
             out  = model(lr_prev, lr_curr)
             loss = charbonnier_loss(out, hr_curr)
+            if args.tv_loss_weight > 0:
+                loss = loss + args.tv_loss_weight * tv_loss(out)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -259,6 +280,8 @@ def train_phase2(args, device, train_loader, val_loader):
                 hr_curr.to(device), flow.to(device))
             out  = model(lr_prev, lr_curr, flow)
             loss = charbonnier_loss(out, hr_curr)
+            if args.tv_loss_weight > 0:
+                loss = loss + args.tv_loss_weight * tv_loss(out)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -349,6 +372,10 @@ def train_phase3(args, device, train_loader, val_loader, full_ds):
                 # --- Pixel loss (Charbonnier) ---
                 pix_loss = charbonnier_loss(out, hr_seq[:, t])
 
+                # --- TV loss (suppress PixelShuffle checkerboard / striping) ---
+                if args.tv_loss_weight > 0:
+                    pix_loss = pix_loss + args.tv_loss_weight * tv_loss(out)
+
                 # --- Temporal consistency loss (t ≥ 1) ---
                 if t > 0 and out_prev is not None and args.temp_loss_weight > 0:
                     t_loss = temporal_consistency_loss(
@@ -427,6 +454,11 @@ def main():
     parser.add_argument("--temp-loss-weight", type=float, default=0.0,
                         help="Weight for temporal consistency loss (0 = disabled). "
                              "Recommended: 0.05–0.2")
+    parser.add_argument("--tv-loss-weight",   type=float, default=0.0,
+                        help="Weight for Total Variation (TV) loss to suppress "
+                             "PixelShuffle checkerboard/striping artefacts. "
+                             "0 = disabled. Recommended: 1e-6 to 1e-4. "
+                             "Applies to all phases.")
     parser.add_argument("--grad-clip",  type=float, default=1.0,
                         help="Max gradient norm (0 = disabled)")
     parser.add_argument("--grad-accum", type=int,   default=1,
@@ -484,7 +516,8 @@ def main():
     if args.phase == 3:
         print(f"Phase 3 options: sched_sampling={args.sched_sampling} "
               f"(ramp={args.sched_sample_ramp}) | curriculum={args.curriculum} | "
-              f"temp_loss_weight={args.temp_loss_weight} | grad_clip={args.grad_clip}")
+              f"temp_loss_weight={args.temp_loss_weight} | "
+              f"tv_loss_weight={args.tv_loss_weight} | grad_clip={args.grad_clip}")
 
     # --- Train ---
     if args.phase == 1:
