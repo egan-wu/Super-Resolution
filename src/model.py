@@ -51,21 +51,23 @@ class TemporalSRResNet(nn.Module):
     Temporal Super-Resolution ResNet.
     Accepts concatenated (Frame t-1, Frame t) as input (6 channels).
     """
-    def __init__(self, in_channels=6, num_res_blocks=16, scale_factor=4):
+    def __init__(self, in_channels=6, num_res_blocks=16, scale_factor=4,
+                 hidden_channels=64):
         super(TemporalSRResNet, self).__init__()
+        ch = hidden_channels
 
         # Initial Feature Extraction (accepts 6 channels instead of 3)
-        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=9, padding=4)
+        self.conv1 = nn.Conv2d(in_channels, ch, kernel_size=9, padding=4)
         self.prelu1 = nn.PReLU()
 
         # Residual Blocks
         self.res_blocks = nn.Sequential(
-            *[ResidualBlock(64) for _ in range(num_res_blocks)]
+            *[ResidualBlock(ch) for _ in range(num_res_blocks)]
         )
 
         # Post-Residual Convolution
-        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(64)
+        self.conv2 = nn.Conv2d(ch, ch, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(ch)
 
         # Upsampling (PixelShuffle + post-smooth)
         # For scale factor 4, two 2× stages.
@@ -74,15 +76,15 @@ class TemporalSRResNet(nn.Module):
         # checkerboard / striping artefacts (expert tip — anti-aliasing post-shuffle).
         upsample_blocks = []
         for _ in range(2):
-            upsample_blocks.append(nn.Conv2d(64, 256, kernel_size=3, padding=1))  # ICNR
+            upsample_blocks.append(nn.Conv2d(ch, ch * 4, kernel_size=3, padding=1))  # ICNR
             upsample_blocks.append(nn.PixelShuffle(2))
-            upsample_blocks.append(nn.Conv2d(64, 64, kernel_size=3, padding=1))   # smooth
+            upsample_blocks.append(nn.Conv2d(ch, ch, kernel_size=3, padding=1))      # smooth
             upsample_blocks.append(nn.PReLU())
 
         self.upsample = nn.Sequential(*upsample_blocks)
 
         # Final Output Layer (outputs 3 channels: RGB)
-        self.conv3 = nn.Conv2d(64, 3, kernel_size=9, padding=4)
+        self.conv3 = nn.Conv2d(ch, 3, kernel_size=9, padding=4)
         self._init_icnr()
 
     def _init_icnr(self):
@@ -132,29 +134,32 @@ class WarpTSRNet(nn.Module):
     a misaligned one, which is the core DLSS trick.
     """
 
-    def __init__(self, in_channels=7, num_res_blocks=16, scale_factor=4):
+    def __init__(self, in_channels=7, num_res_blocks=16, scale_factor=4,
+                 hidden_channels=64, pad_mode="border"):
         super().__init__()
+        self.pad_mode = pad_mode
+        ch = hidden_channels
 
-        self.conv1 = nn.Conv2d(in_channels, 64, kernel_size=9, padding=4)
+        self.conv1 = nn.Conv2d(in_channels, ch, kernel_size=9, padding=4)
         self.prelu1 = nn.PReLU()
 
         self.res_blocks = nn.Sequential(
-            *[ResidualBlock(64) for _ in range(num_res_blocks)]
+            *[ResidualBlock(ch) for _ in range(num_res_blocks)]
         )
 
-        self.conv2 = nn.Conv2d(64, 64, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm2d(64)
+        self.conv2 = nn.Conv2d(ch, ch, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(ch)
 
         # PixelShuffle ×4 with post-shuffle smoothing convs (anti-checkerboard)
         upsample_blocks = []
         for _ in range(2):  # 2x * 2x = 4x
-            upsample_blocks.append(nn.Conv2d(64, 256, kernel_size=3, padding=1))  # ICNR
+            upsample_blocks.append(nn.Conv2d(ch, ch * 4, kernel_size=3, padding=1))  # ICNR
             upsample_blocks.append(nn.PixelShuffle(2))
-            upsample_blocks.append(nn.Conv2d(64, 64, kernel_size=3, padding=1))   # smooth
+            upsample_blocks.append(nn.Conv2d(ch, ch, kernel_size=3, padding=1))      # smooth
             upsample_blocks.append(nn.PReLU())
         self.upsample = nn.Sequential(*upsample_blocks)
 
-        self.conv3 = nn.Conv2d(64, 3, kernel_size=9, padding=4)
+        self.conv3 = nn.Conv2d(ch, 3, kernel_size=9, padding=4)
         self._init_icnr()
 
     def _init_icnr(self):
@@ -170,7 +175,7 @@ class WarpTSRNet(nn.Module):
         x_curr : (B, 3, H, W) — LR frame t
         flow   : (B, 2)        — backward warp flow in LR pixels
         """
-        warped_prev, mask = backward_warp(x_prev, flow)
+        warped_prev, mask = backward_warp(x_prev, flow, padding_mode=self.pad_mode)
 
         x = torch.cat([warped_prev, x_curr, mask], dim=1)  # (B, 7, H, W)
 
@@ -199,32 +204,35 @@ class RecurrentTSRNet(nn.Module):
     increasingly sharp HR outputs — the same principle as DLSS.
     """
 
-    def __init__(self, scale_factor=4, lr_res_blocks=8, hist_res_blocks=4, fuse_res_blocks=4):
+    def __init__(self, scale_factor=4, lr_res_blocks=8, hist_res_blocks=4,
+                 fuse_res_blocks=4, hidden_channels=64, pad_mode="border"):
         super().__init__()
         self.scale_factor = scale_factor
+        self.pad_mode = pad_mode
+        ch = hidden_channels
 
         # --- LR branch (operates at LR resolution) ---
-        self.lr_entry = nn.Sequential(nn.Conv2d(3, 64, 9, padding=4), nn.PReLU())
-        self.lr_res   = nn.Sequential(*[ResidualBlock(64) for _ in range(lr_res_blocks)])
-        self.lr_post  = nn.Sequential(nn.Conv2d(64, 64, 3, padding=1), nn.BatchNorm2d(64))
+        self.lr_entry = nn.Sequential(nn.Conv2d(3, ch, 9, padding=4), nn.PReLU())
+        self.lr_res   = nn.Sequential(*[ResidualBlock(ch) for _ in range(lr_res_blocks)])
+        self.lr_post  = nn.Sequential(nn.Conv2d(ch, ch, 3, padding=1), nn.BatchNorm2d(ch))
         # PixelShuffle ×4: two ×2 stages, each followed by a smoothing conv
         # to suppress checkerboard / striping artefacts on the sub-pixel grid.
         self.lr_up = nn.Sequential(
-            nn.Conv2d(64, 256, 3, padding=1), nn.PixelShuffle(2),     # pre-shuffle (ICNR)
-            nn.Conv2d(64,  64, 3, padding=1), nn.PReLU(),             # post-shuffle smooth
-            nn.Conv2d(64, 256, 3, padding=1), nn.PixelShuffle(2),     # pre-shuffle (ICNR)
-            nn.Conv2d(64,  64, 3, padding=1), nn.PReLU(),             # post-shuffle smooth
-        )  # output: (B, 64, H_hr, W_hr)
+            nn.Conv2d(ch, ch * 4, 3, padding=1), nn.PixelShuffle(2),  # pre-shuffle (ICNR)
+            nn.Conv2d(ch, ch,     3, padding=1), nn.PReLU(),           # post-shuffle smooth
+            nn.Conv2d(ch, ch * 4, 3, padding=1), nn.PixelShuffle(2),  # pre-shuffle (ICNR)
+            nn.Conv2d(ch, ch,     3, padding=1), nn.PReLU(),           # post-shuffle smooth
+        )  # output: (B, ch, H_hr, W_hr)
 
         # --- History branch (operates at HR resolution) ---
         # Input: warped HR(t-1) [3ch] + occlusion mask [1ch] = 4ch
-        self.hist_entry = nn.Sequential(nn.Conv2d(4, 64, 3, padding=1), nn.PReLU())
-        self.hist_res   = nn.Sequential(*[ResidualBlock(64) for _ in range(hist_res_blocks)])
+        self.hist_entry = nn.Sequential(nn.Conv2d(4, ch, 3, padding=1), nn.PReLU())
+        self.hist_res   = nn.Sequential(*[ResidualBlock(ch) for _ in range(hist_res_blocks)])
 
         # --- Fusion (at HR resolution) ---
-        self.fuse_entry = nn.Sequential(nn.Conv2d(128, 64, 3, padding=1), nn.PReLU())
-        self.fuse_res   = nn.Sequential(*[ResidualBlock(64) for _ in range(fuse_res_blocks)])
-        self.output     = nn.Conv2d(64, 3, 9, padding=4)
+        self.fuse_entry = nn.Sequential(nn.Conv2d(ch * 2, ch, 3, padding=1), nn.PReLU())
+        self.fuse_res   = nn.Sequential(*[ResidualBlock(ch) for _ in range(fuse_res_blocks)])
+        self.output     = nn.Conv2d(ch, 3, 9, padding=4)
         self._init_icnr()
 
     def _init_icnr(self):
@@ -246,28 +254,26 @@ class RecurrentTSRNet(nn.Module):
         s = self.scale_factor
 
         if flow_lr.dim() == 2:
-            # Rigid flow: scale scalar displacement to HR pixel space
-            flow_hr = flow_lr * s                                            # (B, 2)
+            flow_hr = flow_lr * s
         else:
-            # Dense flow: upsample spatial dims AND scale values to HR pixel space
             flow_hr = F.interpolate(
                 flow_lr, scale_factor=s, mode="bilinear", align_corners=False
-            ) * s                                                            # (B, 2, H_hr, W_hr)
+            ) * s
 
-        warped_hr, mask = backward_warp(hr_prev, flow_hr)
+        warped_hr, mask = backward_warp(hr_prev, flow_hr, padding_mode=self.pad_mode)
 
         # LR branch → upsample to HR feature space
         x = self.lr_entry(lr_curr)
         x = x + self.lr_post(self.lr_res(x))
-        x = self.lr_up(x)                          # (B, 64, H_hr, W_hr)
+        x = self.lr_up(x)                          # (B, ch, H_hr, W_hr)
 
         # History branch
         hist_in = torch.cat([warped_hr, mask], dim=1)  # (B, 4, H_hr, W_hr)
         h = self.hist_entry(hist_in)
-        h = self.hist_res(h)                            # (B, 64, H_hr, W_hr)
+        h = self.hist_res(h)                            # (B, ch, H_hr, W_hr)
 
         # Fusion
-        f = self.fuse_entry(torch.cat([x, h], dim=1))  # (B, 64, H_hr, W_hr)
+        f = self.fuse_entry(torch.cat([x, h], dim=1))  # (B, ch, H_hr, W_hr)
         f = self.fuse_res(f)
         return self.output(f)                           # (B, 3, H_hr, W_hr)
 

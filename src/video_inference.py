@@ -57,7 +57,9 @@ def run_video_sr(phase: int,
                  model_path: str,
                  input_video: str,
                  output_video: str,
-                 scale_factor: int = 4):
+                 scale_factor: int = 4,
+                 hidden_channels: int = 64,
+                 pad_mode: str = "reflection"):
     """
     Run frame-by-frame SR on `input_video` and write side-by-side comparison
     (Bicubic | SR) to `output_video`.
@@ -67,11 +69,16 @@ def run_video_sr(phase: int,
 
     # Load model
     if phase == 1:
-        model = TemporalSRResNet(scale_factor=scale_factor).to(device)
+        model = TemporalSRResNet(scale_factor=scale_factor,
+                                  hidden_channels=hidden_channels).to(device)
     elif phase == 2:
-        model = WarpTSRNet(scale_factor=scale_factor).to(device)
+        model = WarpTSRNet(scale_factor=scale_factor,
+                            hidden_channels=hidden_channels,
+                            pad_mode=pad_mode).to(device)
     else:
-        model = RecurrentTSRNet(scale_factor=scale_factor).to(device)
+        model = RecurrentTSRNet(scale_factor=scale_factor,
+                                 hidden_channels=hidden_channels,
+                                 pad_mode=pad_mode).to(device)
 
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
@@ -215,6 +222,11 @@ if __name__ == "__main__":
     parser.add_argument("--lr-width",   type=int, default=320)
     parser.add_argument("--lr-height",  type=int, default=240)
     parser.add_argument("--frames",     type=int, default=120)
+    parser.add_argument("--hidden-channels", type=int, default=64,
+                        help="Hidden channel width (must match training checkpoint)")
+    parser.add_argument("--pad-mode", type=str, default="reflection",
+                        choices=["zeros", "border", "reflection"],
+                        help="grid_sample padding mode (must match training)")
     args = parser.parse_args()
 
     input_video = args.input_video
@@ -232,4 +244,6 @@ if __name__ == "__main__":
         model_path  = args.checkpoint,
         input_video = input_video,
         output_video= args.output_video,
+        hidden_channels=args.hidden_channels,
+        pad_mode    = args.pad_mode,
     )

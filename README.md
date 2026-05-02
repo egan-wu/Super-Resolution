@@ -92,6 +92,15 @@ python src/train.py --phase <1|2|3> [options]
 | `--flickr2k` | off | Download and use Flickr2K HR (~2650 images) |
 | `--data-dir` | `""` | Custom image directory (overrides `--div2k`/`--flickr2k`) |
 
+### Architecture & capacity options (all phases)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--hidden-channels` | `64` | Hidden channel width for all models. `128` = ~4× params, needs ~4× VRAM. Checkpoints are incompatible across different widths. |
+| `--pad-mode` | `reflection` | `grid_sample` padding mode for backward warp: `reflection` (recommended), `border`, or `zeros`. `reflection` avoids boundary artefacts. |
+| `--augment` | off | Random horizontal/vertical flip + 90° rotation. Effectively ×8 dataset. |
+| `--cosine-anneal` | off | CosineAnnealingLR scheduler (eta_min = lr × 0.01). Helps fine-tune in later epochs. |
+
 ### Phase 3 enhancement options
 
 | Flag | Default | Description |
@@ -135,20 +144,31 @@ python src/train.py --phase 3 --epochs 5000 --batch-size 4 \
     --sched-sampling --curriculum \
     --temp-loss-weight 0.1 --grad-clip 1.0
 
-# Phase 3 — Anti-striping config (recommended after this update)
+# Phase 3 — Full recommended config (capacity + augment + cosine + all fixes)
 python src/train.py --phase 3 --epochs 5000 --batch-size 4 \
     --div2k --flickr2k \
+    --hidden-channels 128 --pad-mode reflection \
+    --augment --cosine-anneal \
     --sched-sampling --curriculum \
-    --temp-loss-weight 0.1 \
-    --tv-loss-weight  1e-5 \
+    --temp-loss-weight 0.1 --tv-loss-weight 1e-5 \
     --grad-clip 1.0
 
 # Phase 3 — Quick local smoke test (~1–2 h on RTX 3050 8 GB)
 python src/train.py --phase 3 --epochs 100 \
     --batch-size 2 --seq-len 4 --div2k \
+    --augment --cosine-anneal \
     --sched-sampling --sched-sample-ramp 50 --curriculum \
     --temp-loss-weight 0.1 --tv-loss-weight 1e-5 \
     --grad-clip 1.0 --val-every 20
+
+# Phase 3 — Large model on RTX 4090 24GB (RunPod)
+python src/train.py --phase 3 --epochs 2000 --batch-size 8 \
+    --div2k --flickr2k \
+    --hidden-channels 128 --pad-mode reflection \
+    --augment --cosine-anneal \
+    --sched-sampling --sched-sample-ramp 800 --curriculum \
+    --temp-loss-weight 0.1 --tv-loss-weight 1e-5 \
+    --grad-clip 1.0 --val-every 100
 
 # Phase 3 — OOM fallback (simulate batch-size 8 with 1 GPU sample at a time)
 python src/train.py --phase 3 --epochs 5000 \

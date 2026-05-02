@@ -231,8 +231,12 @@ def validate_p3(model, loader, device, scale_factor):
 # ---------------------------------------------------------------------------
 
 def train_phase1(args, device, train_loader, val_loader):
-    model     = TemporalSRResNet(scale_factor=4).to(device)
+    model     = TemporalSRResNet(scale_factor=4,
+                                  hidden_channels=args.hidden_channels).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = (optim.lr_scheduler.CosineAnnealingLR(
+                     optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+                 if args.cosine_anneal else None)
     best_psnr, best_path = 0.0, os.path.join(args.save_dir, "p1_best.pth")
 
     for epoch in range(1, args.epochs + 1):
@@ -247,9 +251,13 @@ def train_phase1(args, device, train_loader, val_loader):
                 loss = loss + args.tv_loss_weight * tv_loss(out)
             optimizer.zero_grad()
             loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             loss_sum += loss.item()
 
+        if scheduler:
+            scheduler.step()
         avg = loss_sum / len(train_loader)
         is_milestone = epoch % args.val_every == 0 or epoch == args.epochs
         if is_milestone:
@@ -267,8 +275,13 @@ def train_phase1(args, device, train_loader, val_loader):
 
 
 def train_phase2(args, device, train_loader, val_loader):
-    model     = WarpTSRNet(scale_factor=4).to(device)
+    model     = WarpTSRNet(scale_factor=4,
+                            hidden_channels=args.hidden_channels,
+                            pad_mode=args.pad_mode).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = (optim.lr_scheduler.CosineAnnealingLR(
+                     optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+                 if args.cosine_anneal else None)
     best_psnr, best_path = 0.0, os.path.join(args.save_dir, "p2_best.pth")
 
     for epoch in range(1, args.epochs + 1):
@@ -284,9 +297,13 @@ def train_phase2(args, device, train_loader, val_loader):
                 loss = loss + args.tv_loss_weight * tv_loss(out)
             optimizer.zero_grad()
             loss.backward()
+            if args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             loss_sum += loss.item()
 
+        if scheduler:
+            scheduler.step()
         avg = loss_sum / len(train_loader)
         is_milestone = epoch % args.val_every == 0 or epoch == args.epochs
         if is_milestone:
@@ -316,8 +333,13 @@ def train_phase3(args, device, train_loader, val_loader, full_ds):
     6. Curriculum seq_len     -- progressively longer sequences (4 → 6 → 8)
     """
     scale     = 4
-    model     = RecurrentTSRNet(scale_factor=scale).to(device)
+    model     = RecurrentTSRNet(scale_factor=scale,
+                                 hidden_channels=args.hidden_channels,
+                                 pad_mode=args.pad_mode).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = (optim.lr_scheduler.CosineAnnealingLR(
+                     optimizer, T_max=args.epochs, eta_min=args.lr * 0.01)
+                 if args.cosine_anneal else None)
     best_psnr, best_path = 0.0, os.path.join(args.save_dir, "p3_best.pth")
 
     current_seq_len = args.seq_len
@@ -399,6 +421,8 @@ def train_phase3(args, device, train_loader, val_loader, full_ds):
 
             loss_sum += (seq_loss / T).item()   # log unscaled loss
 
+        if scheduler:
+            scheduler.step()
         avg = loss_sum / len(train_loader)
         is_milestone = epoch % args.val_every == 0 or epoch == args.epochs
         if is_milestone:
@@ -465,12 +489,32 @@ def main():
                         help="Gradient accumulation steps (OOM fallback). "
                              "Effective batch = batch-size × grad-accum")
 
+    # --- Capacity / architecture ---
+    parser.add_argument("--hidden-channels", type=int, default=64,
+                        help="Hidden channel width for all models (default 64). "
+                             "128 = ~4× params, needs ~4× VRAM. "
+                             "Incompatible with checkpoints trained at different width.")
+    parser.add_argument("--pad-mode", type=str, default="reflection",
+                        choices=["zeros", "border", "reflection"],
+                        help="grid_sample padding mode for backward warp. "
+                             "'reflection' avoids boundary artifacts (recommended).")
+
+    # --- Augmentation & scheduler ---
+    parser.add_argument("--augment", action="store_true",
+                        help="Enable random flip + 90° rotation augmentation. "
+                             "Effectively multiplies dataset ×8.")
+    parser.add_argument("--cosine-anneal", action="store_true",
+                        help="Use CosineAnnealingLR scheduler (T_max = epochs, "
+                             "eta_min = lr × 0.01). Helps fine-tune in later epochs.")
+
     args = parser.parse_args()
 
     os.makedirs(args.save_dir, exist_ok=True)
     device = get_device()
     print(f"Phase {args.phase} | device: {device} | epochs: {args.epochs} | "
-          f"batch: {args.batch_size} × accum {args.grad_accum}")
+          f"batch: {args.batch_size} × accum {args.grad_accum} | "
+          f"hidden_ch: {args.hidden_channels} | pad: {args.pad_mode} | "
+          f"augment: {args.augment} | cosine: {args.cosine_anneal}")
 
     # --- Dataset setup ---
     if args.data_dir:
@@ -489,11 +533,12 @@ def main():
 
     if args.phase in (1, 2):
         full_ds = SRTemporalDataset(data_dirs, scale_factor=4,
-                                    crop_size=128, max_offset=8)
+                                    crop_size=128, max_offset=8,
+                                    augment=args.augment)
     else:
         full_ds = SRSequenceDataset(data_dirs, scale_factor=4, crop_size=128,
                                     max_offset=8, seq_len=args.seq_len,
-                                    use_jitter=True)
+                                    use_jitter=True, augment=args.augment)
 
     val_size   = max(1, int(0.2 * len(full_ds)))
     train_size = len(full_ds) - val_size

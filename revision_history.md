@@ -4,6 +4,110 @@ A concise record of each improvement round, its motivation, approach, and core i
 
 ---
 
+## Capacity & Quality Round (2026-05-02)
+
+Three improvements targeting limited model capacity, boundary artefacts, and
+training efficiency.
+
+---
+
+### 11. Configurable Hidden Channels (`src/model.py`)
+
+**Problem:** 64 hidden channels across all ResBlocks limits the model's
+representational capacity. With larger datasets (DIV2K + Flickr2K) the model
+finds a PixelShuffle shortcut (striping) instead of learning genuine detail
+because it lacks capacity for the latter.
+
+**Fix:** All three models (`TemporalSRResNet`, `WarpTSRNet`, `RecurrentTSRNet`)
+accept `hidden_channels` parameter (default 64 for backward compat). Setting
+`--hidden-channels 128` gives ~4× parameters and capacity.
+
+**Key choices:**
+- Parameter exposed via `--hidden-channels` flag (default 64).
+- `ch * 4` used for PixelShuffle conv (instead of hardcoded 256).
+- Fusion layer uses `ch * 2` input channels (instead of hardcoded 128).
+- Checkpoints are incompatible across different `hidden_channels` values.
+
+**Core idea:** More capacity → model can represent fine detail without resorting
+to regular-pattern shortcuts.
+
+---
+
+### 12. Reflection Padding for Warp (`src/warp.py`, `src/model.py`)
+
+**Problem:** `grid_sample` with `padding_mode="zeros"` fills out-of-bounds
+samples with black, creating dark boundary artefacts. `"border"` repeats edge
+pixels, which can smear. Neither is ideal for the occlusion-masked warp.
+
+**Fix:** `backward_warp()` now accepts `padding_mode` parameter. Models
+(`WarpTSRNet`, `RecurrentTSRNet`) store and pass `pad_mode` through to warp.
+Default changed from `"border"` to `"reflection"` which mirrors content
+smoothly across boundaries.
+
+**Key choices:**
+- `--pad-mode` flag: `reflection` (default, recommended), `border`, `zeros`.
+- Applied to Phase 2 and 3 (Phase 1 doesn't use warp).
+- Occlusion mask still correctly marks out-of-bounds pixels.
+
+**Core idea:** Reflection padding provides natural-looking content at boundaries
+instead of black fill or edge repetition.
+
+---
+
+### 13. Data Augmentation (`src/dataset.py`)
+
+**Problem:** Even with ~2750 images, the model sees each crop in only one
+orientation. Random spatial transforms effectively multiply the dataset ×8
+(4 rotations × 2 flips) and force rotational invariance.
+
+**Fix:** Both `SRTemporalDataset` and `SRSequenceDataset` accept `augment=True`.
+When enabled, each sample is randomly flipped horizontally, vertically, and/or
+transposed (90° rotation). Transforms are applied consistently to all frames
+in a sequence.
+
+**Key choices:**
+- `--augment` flag (default off, backward compat).
+- Flow vectors become approximate after spatial transforms — this is intentional;
+  the model learns robustness to flow noise, matching real-world optical flow.
+- Applied at data loading time, zero compute overhead.
+
+**Core idea:** ×8 effective dataset via geometry transforms, forcing the model
+to learn orientation-invariant features.
+
+---
+
+### 14. Cosine Annealing LR Scheduler (`src/train.py`)
+
+**Problem:** Constant learning rate throughout training. In later epochs the
+model overshoots fine details because the step size is too large for the
+flatter loss landscape.
+
+**Fix:** `--cosine-anneal` enables `CosineAnnealingLR` with `T_max=epochs`
+and `eta_min = lr × 0.01`. Learning rate smoothly decays from `lr` to near
+zero following a cosine curve.
+
+**Key choices:**
+- Optional flag for backward compat.
+- `eta_min = lr * 0.01` (not zero) to avoid complete stagnation.
+- Applied to all three phases.
+- Gradient clipping now also applied to Phase 1 and 2 (was Phase 3 only).
+
+**Core idea:** Cosine schedule = aggressive early learning + fine late
+refinement. Standard in modern SR (EDSR, SwinIR, HAT).
+
+---
+
+### Updated Summary Table
+
+| Change | Files | Key Flag / API |
+|---|---|---|
+| Configurable hidden channels | `model.py` | `--hidden-channels 128` |
+| Reflection padding for warp | `warp.py`, `model.py` | `--pad-mode reflection` |
+| Data augmentation (flip+rot) | `dataset.py` | `--augment` |
+| Cosine annealing LR | `train.py` | `--cosine-anneal` |
+
+---
+
 ## Anti-Striping Round (2026-04-30)
 
 Addresses the **black-grid / striping artefact** observed in Phase 3 outputs after

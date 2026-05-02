@@ -21,15 +21,20 @@ fi
 nohup python -u src/train.py \
     --phase 3 \
     --epochs 2000 \
-    --batch-size 16 \
+    --batch-size 8 \
     --seq-len 4 \
     --lr 1e-4 \
     --val-every 100 \
     --div2k --flickr2k \
+    --hidden-channels 128 \
+    --pad-mode reflection \
+    --augment \
+    --cosine-anneal \
     --sched-sampling \
     --sched-sample-ramp 800 \
     --curriculum \
     --temp-loss-weight 0.1 \
+    --tv-loss-weight 1e-5 \
     --grad-clip 1.0 \
     --save-dir /workspace/Super-Resolution/checkpoints \
     > "$LOG_FILE" 2>&1 &

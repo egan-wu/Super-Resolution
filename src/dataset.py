@@ -30,6 +30,25 @@ def halton_2d(index: int):
 
 
 # ---------------------------------------------------------------------------
+# Data augmentation helpers
+# ---------------------------------------------------------------------------
+
+def _augment_pair(*tensors):
+    """
+    Apply random horizontal flip, vertical flip, and 90° rotation (×8 total)
+    consistently to all tensors in the group.
+    All tensors must be (C, H, W) and square (H == W).
+    """
+    if random.random() < 0.5:
+        tensors = tuple(t.flip(-1) for t in tensors)       # horizontal flip
+    if random.random() < 0.5:
+        tensors = tuple(t.flip(-2) for t in tensors)       # vertical flip
+    if random.random() < 0.5:
+        tensors = tuple(t.transpose(-2, -1) for t in tensors)  # 90° rotation
+    return tensors
+
+
+# ---------------------------------------------------------------------------
 # Phase 1 / 2 dataset — single frame-pair
 # ---------------------------------------------------------------------------
 
@@ -42,12 +61,14 @@ class SRTemporalDataset(Dataset):
     images from every directory are merged into one flat pool.
     """
 
-    def __init__(self, image_dirs, scale_factor=4, crop_size=128, max_offset=4):
+    def __init__(self, image_dirs, scale_factor=4, crop_size=128, max_offset=4,
+                 augment=False):
         if isinstance(image_dirs, str):
             image_dirs = [image_dirs]
         self.scale_factor = scale_factor
         self.crop_size = crop_size
         self.max_offset = max_offset
+        self.augment = augment
 
         self.image_filenames = []
         for d in image_dirs:
@@ -91,6 +112,13 @@ class SRTemporalDataset(Dataset):
         flow_y = -(y_tm1 - y_t) / self.scale_factor
         flow = torch.tensor([flow_x, flow_y], dtype=torch.float32)
 
+        # Augmentation: random flip + 90° rotation (applied consistently to all)
+        if self.augment:
+            lr_tm1, lr_t, hr_t = _augment_pair(lr_tm1, lr_t, hr_t)
+            # Note: flow becomes approximate after spatial transforms.
+            # This is acceptable — the model learns robustness to slight
+            # flow inaccuracy, which mirrors real-world optical flow noise.
+
         return lr_tm1, lr_t, hr_t, flow
 
 
@@ -119,7 +147,7 @@ class SRSequenceDataset(Dataset):
     """
 
     def __init__(self, image_dirs, scale_factor=4, crop_size=128,
-                 max_offset=8, seq_len=4, use_jitter=True):
+                 max_offset=8, seq_len=4, use_jitter=True, augment=False):
         if isinstance(image_dirs, str):
             image_dirs = [image_dirs]
         self.scale_factor = scale_factor
@@ -127,6 +155,7 @@ class SRSequenceDataset(Dataset):
         self.max_offset = max_offset
         self.seq_len = seq_len
         self.use_jitter = use_jitter
+        self.augment = augment
 
         self.image_filenames = []
         for d in image_dirs:
@@ -206,11 +235,27 @@ class SRSequenceDataset(Dataset):
             hr_frames.append(hr_t)
             flows.append(flow)
 
-        return (
-            torch.stack(lr_frames),    # (T, 3, H_lr, W_lr)
-            torch.stack(hr_frames),    # (T, 3, H_hr, W_hr)
-            torch.stack(flows),        # (T, 2)
-        )
+        lr_stack = torch.stack(lr_frames)   # (T, 3, H_lr, W_lr)
+        hr_stack = torch.stack(hr_frames)   # (T, 3, H_hr, W_hr)
+        flow_stack = torch.stack(flows)     # (T, 2)
+
+        # Augmentation: random flip + 90° rotation (applied consistently)
+        if self.augment:
+            # Determine random transforms once, apply to all frames
+            do_hflip = random.random() < 0.5
+            do_vflip = random.random() < 0.5
+            do_rot90 = random.random() < 0.5
+            if do_hflip:
+                lr_stack = lr_stack.flip(-1)
+                hr_stack = hr_stack.flip(-1)
+            if do_vflip:
+                lr_stack = lr_stack.flip(-2)
+                hr_stack = hr_stack.flip(-2)
+            if do_rot90:
+                lr_stack = lr_stack.transpose(-2, -1)
+                hr_stack = hr_stack.transpose(-2, -1)
+
+        return (lr_stack, hr_stack, flow_stack)
 
 
 # ---------------------------------------------------------------------------

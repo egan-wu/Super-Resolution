@@ -27,15 +27,19 @@ def bicubic_upsample(lr: torch.Tensor, scale: int) -> torch.Tensor:
 # Phase 1 / 2 inference
 # ---------------------------------------------------------------------------
 
-def run_inference_p12(phase, model_path, image_path, output_path, scale_factor=4, offset=5):
+def run_inference_p12(phase, model_path, image_path, output_path, scale_factor=4,
+                      offset=5, hidden_channels=64, pad_mode="reflection"):
     device = get_device()
     print(f"Using device: {device}")
 
     if phase == 1:
-        model = TemporalSRResNet(scale_factor=scale_factor).to(device)
+        model = TemporalSRResNet(scale_factor=scale_factor,
+                                  hidden_channels=hidden_channels).to(device)
         label = "Phase 1 — EarlyFusion"
     else:
-        model = WarpTSRNet(scale_factor=scale_factor).to(device)
+        model = WarpTSRNet(scale_factor=scale_factor,
+                            hidden_channels=hidden_channels,
+                            pad_mode=pad_mode).to(device)
         label = "Phase 2 — WarpThenFuse"
 
     model.load_state_dict(torch.load(model_path, map_location=device))
@@ -104,11 +108,14 @@ def run_inference_p12(phase, model_path, image_path, output_path, scale_factor=4
 # ---------------------------------------------------------------------------
 
 def run_inference_p3(model_path, image_path, output_path, scale_factor=4,
-                     offset=5, num_frames=6):
+                     offset=5, num_frames=6, hidden_channels=64,
+                     pad_mode="reflection"):
     device = get_device()
     print(f"Using device: {device}")
 
-    model = RecurrentTSRNet(scale_factor=scale_factor).to(device)
+    model = RecurrentTSRNet(scale_factor=scale_factor,
+                             hidden_channels=hidden_channels,
+                             pad_mode=pad_mode).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
 
@@ -201,11 +208,20 @@ if __name__ == "__main__":
                         help="Simulated camera pan in pixels (Phase 1/2)")
     parser.add_argument("--num-frames", type=int, default=6,
                         help="Number of recurrent frames to accumulate (Phase 3)")
+    parser.add_argument("--hidden-channels", type=int, default=64,
+                        help="Hidden channel width (must match training checkpoint)")
+    parser.add_argument("--pad-mode", type=str, default="reflection",
+                        choices=["zeros", "border", "reflection"],
+                        help="grid_sample padding mode (must match training)")
     args = parser.parse_args()
 
     if args.phase in (1, 2):
         run_inference_p12(args.phase, args.checkpoint, args.image, args.output,
-                          offset=args.offset)
+                          offset=args.offset,
+                          hidden_channels=args.hidden_channels,
+                          pad_mode=args.pad_mode)
     else:
         run_inference_p3(args.checkpoint, args.image, args.output,
-                         offset=args.offset, num_frames=args.num_frames)
+                         offset=args.offset, num_frames=args.num_frames,
+                         hidden_channels=args.hidden_channels,
+                         pad_mode=args.pad_mode)

@@ -2,7 +2,8 @@ import torch
 import torch.nn.functional as F
 
 
-def backward_warp(frame: torch.Tensor, flow: torch.Tensor):
+def backward_warp(frame: torch.Tensor, flow: torch.Tensor,
+                  padding_mode: str = "border"):
     """
     Backward warp `frame` using a flow field.
 
@@ -58,6 +59,6 @@ def backward_warp(frame: torch.Tensor, flow: torch.Tensor):
 
     warped = F.grid_sample(
         frame, sample_grid,
-        mode="bilinear", padding_mode="border", align_corners=True
+        mode="bilinear", padding_mode=padding_mode, align_corners=True
     )
     return warped, mask
